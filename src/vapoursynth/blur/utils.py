@@ -51,36 +51,38 @@ def assume_scaled_fps(clip, timescale):
     )
 
 
+def convert_format(video: vs.VideoNode, is_full_color_range: bool, target_format):
+    if video.format.id == target_format:
+        return video
+
+    convert_kwargs = {
+        "format": target_format,
+        "range_in": is_full_color_range,
+        "range": is_full_color_range,
+    }
+
+    target_family = core.get_video_format(target_format).color_family
+    if target_family == vs.RGB and video.format.color_family == vs.YUV:
+        convert_kwargs["matrix_in_s"] = "709"
+    elif target_family == vs.YUV and video.format.color_family == vs.RGB:
+        convert_kwargs["matrix_s"] = "709"
+
+    return core.resize.Point(video, **convert_kwargs)
+
+
 def with_format(
-    video: vs.VideoNode, is_full_color_range: bool, target_format, process_func
+    video: vs.VideoNode,
+    is_full_color_range: bool,
+    target_format,
+    process_func,
+    restore_format=True,
 ):
-    orig_format = video.format
-    needs_conversion = orig_format.id != target_format
+    orig_format = video.format.id
 
-    if needs_conversion:
-        convert_kwargs = {
-            "format": target_format,
-            "range_in": is_full_color_range,
-            "range": is_full_color_range,
-        }
-
-        if target_format == vs.RGBS and orig_format.color_family == vs.YUV:
-            convert_kwargs["matrix_in_s"] = "709"
-
-        video = core.resize.Point(video, **convert_kwargs)
-
+    video = convert_format(video, is_full_color_range, target_format)
     video = process_func(video)
 
-    if needs_conversion:
-        convert_back_kwargs = {
-            "format": orig_format.id,
-            "range_in": is_full_color_range,
-            "range": is_full_color_range,
-        }
-
-        if target_format == vs.RGBS and orig_format.color_family == vs.YUV:
-            convert_back_kwargs["matrix_s"] = "709"
-
-        video = core.resize.Point(video, **convert_back_kwargs)
+    if restore_format:
+        video = convert_format(video, is_full_color_range, orig_format)
 
     return video

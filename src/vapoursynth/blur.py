@@ -113,6 +113,16 @@ if settings["deduplicate"] and settings["deduplicate_range"] != 0:
                 debug=settings["debug"],
             )
 
+# svp works in yuv420p8. converting its (many) output frames back to the source format is
+# deferred until after blending, where there are far fewer frames. point-resizing chroma is a
+# plain sample duplication, so blending before or after it gives the same result.
+source_format = video.format.id
+
+
+def restore_source_format(video):
+    return u.convert_format(video, is_full_color_range, source_format)
+
+
 # interpolation
 if settings["interpolate"]:
 
@@ -206,6 +216,7 @@ if settings["interpolate"]:
                         overlap=0,
                         masking=interpolation_mask_area,
                         gpu=settings["gpu_interpolation"],
+                        restore_format=False,
                     )
                 else:
                     # insert interpolated fps
@@ -220,6 +231,7 @@ if settings["interpolate"]:
                         super_string=settings["super_string"],
                         vectors_string=settings["vectors_string"],
                         smooth_str=smooth_str,
+                        restore_format=False,
                     )
 
         fps_added = video.fps - old_fps
@@ -257,11 +269,13 @@ if settings["blur"]:
                 video = blur.blending.average(video, weights)
             else:
                 video = blur.blending.average_bright(
-                    video, is_full_color_range, gamma, weights
+                    restore_source_format(video), is_full_color_range, gamma, weights
                 )
 
     # set exact fps
     video = blur.interpolate.change_fps(video, settings["blur_output_fps"])
+
+video = restore_source_format(video)
 
 # filters
 if settings["filters"]:

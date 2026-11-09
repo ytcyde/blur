@@ -228,6 +228,10 @@ def fill_drops_old(clip, threshold=0.1, debug=False):
         raise ValueError("This is not a clip")
 
     differences = core.std.PlaneStats(clip, clip[0] + clip)
+    # difference to the next frame. a dupe whose next frame is also a dupe is part of a static
+    # stretch: interpolating it with the next frame reproduces the same image, so skip the
+    # (expensive) motion interpolation for it.
+    next_differences = core.std.PlaneStats(clip, clip[1:] + clip[-1])
 
     super = core.mv.Super(clip)
     forward_vectors = core.mv.Analyse(super, isb=False)
@@ -236,20 +240,31 @@ def fill_drops_old(clip, threshold=0.1, debug=False):
         clip, super, mvbw=backwards_vectors, mvfw=forward_vectors, ml=1
     )
 
-    def selectFunc(n, f):
-        if f.props["PlaneStatsDiff"] < threshold:
-            if debug:
-                return core.text.Text(
-                    filldrops,
-                    f"interpolated, diff: {f.props['PlaneStatsDiff']:.3f}",
-                    alignment=8,
-                )
+    if not debug:
+        # pick per frame natively instead of through a python FrameEval, which holds the GIL
+        # for every frame and stalls the filters downstream
+        return core.akarin.Select(
+            [clip, filldrops],
+            [differences, next_differences],
+            f"x.PlaneStatsDiff {threshold} < y.PlaneStatsDiff {threshold} >= and 1 0 ?",
+        )
 
-            return filldrops
+    def selectFunc(n, f):
+        if f[0].props["PlaneStatsDiff"] < threshold:
+            if f[1].props["PlaneStatsDiff"] < threshold:
+                return clip
+
+            return core.text.Text(
+                filldrops,
+                f"interpolated, diff: {f[0].props['PlaneStatsDiff']:.3f}",
+                alignment=8,
+            )
         else:
             return clip
 
-    return core.std.FrameEval(clip, selectFunc, prop_src=differences)
+    return core.std.FrameEval(
+        clip, selectFunc, prop_src=[differences, next_differences]
+    )
 
 
 def fill_drops_svp(

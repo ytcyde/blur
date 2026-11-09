@@ -89,6 +89,7 @@ def svp(
     super_string: str,
     vectors_string: str,
     smooth_str: str,
+    restore_format=True,
 ):
     def process(video):
         super = core.svp1.Super(video, super_string)
@@ -102,7 +103,9 @@ def svp(
             smooth_str,
         )
 
-    return u.with_format(_video, is_full_color_range, vs.YUV420P8, process)
+    return u.with_format(
+        _video, is_full_color_range, vs.YUV420P8, process, restore_format
+    )
 
 
 def interpolate_svp(
@@ -116,6 +119,7 @@ def interpolate_svp(
     speed=DEFAULT_SPEED,
     masking=DEFAULT_MASKING,
     gpu=DEFAULT_GPU,
+    restore_format=True,
 ):
     preset = preset.lower()
 
@@ -127,7 +131,14 @@ def interpolate_svp(
         new_fps, preset, algorithm, blocksize, overlap, speed, masking, gpu
     )
 
-    return svp(video, is_full_color_range, super_string, vectors_string, smooth_string)
+    return svp(
+        video,
+        is_full_color_range,
+        super_string,
+        vectors_string,
+        smooth_string,
+        restore_format,
+    )
 
 
 def change_fps(clip, fpsnum, fpsden=1):  # this is just directly from havsfunc
@@ -135,6 +146,16 @@ def change_fps(clip, fpsnum, fpsden=1):  # this is just directly from havsfunc
         raise vs.Error("ChangeFPS: This is not a clip")
 
     factor = (fpsnum / fpsden) * (clip.fps_den / clip.fps_num)
+    length = math.floor(len(clip) * factor)
+
+    # when the source frames picked are evenly spaced (e.g. 1200 -> 60 fps), select them natively
+    # instead of building a new node per frame in python, which serialises on the GIL
+    indices = [math.floor(n / factor) for n in range(length)]
+    if length > 1:
+        step = indices[1] - indices[0]
+        if step > 0 and all(b - a == step for a, b in zip(indices, indices[1:])):
+            selected = clip[indices[0] :: step][:length]
+            return core.std.AssumeFPS(selected, fpsnum=fpsnum, fpsden=fpsden)
 
     def frame_adjuster(n):
         real_n = math.floor(n / factor)
