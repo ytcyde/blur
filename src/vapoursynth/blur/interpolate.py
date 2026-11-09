@@ -90,11 +90,12 @@ def svp(
     vectors_string: str,
     smooth_str: str,
     restore_format=True,
+    static_threshold: float | None = None,
 ):
     def process(video):
         super = core.svp1.Super(video, super_string)
         vectors = core.svp1.Analyse(super["clip"], super["data"], video, vectors_string)
-        return core.svp2.SmoothFps(
+        interpolated = core.svp2.SmoothFps(
             video,
             super["clip"],
             super["data"],
@@ -103,8 +104,43 @@ def svp(
             smooth_str,
         )
 
+        if static_threshold is None:
+            return interpolated
+
+        return hold_static_intervals(video, interpolated, static_threshold)
+
     return u.with_format(
         _video, is_full_color_range, vs.YUV420P8, process, restore_format
+    )
+
+
+def hold_static_intervals(
+    video: vs.VideoNode, interpolated: vs.VideoNode, threshold: float
+):
+    # when two consecutive source frames are duplicates there's no motion to interpolate between
+    # them, so the frames in between are taken from the nearest source frame rather than rendered.
+    # rendering is by far the slowest part of the pipeline, so this is a big win on static footage
+    factor = interpolated.fps / video.fps
+    if factor.denominator != 1 or factor < 2:
+        return interpolated
+
+    factor = int(factor)
+    if len(interpolated) > len(video) * factor:
+        return interpolated
+
+    next_video = video[1:] + video[-1]
+    differences = core.std.PlaneStats(video, next_video)
+
+    first_half = (factor + 1) // 2
+    held = core.std.Interleave(
+        [video] * first_half + [next_video] * (factor - first_half)
+    )
+    differences = core.std.Interleave([differences] * factor)
+
+    return core.akarin.Select(
+        [interpolated, held[: len(interpolated)]],
+        differences[: len(interpolated)],
+        f"x.PlaneStatsDiff {threshold} < 1 0 ?",
     )
 
 
@@ -120,6 +156,7 @@ def interpolate_svp(
     masking=DEFAULT_MASKING,
     gpu=DEFAULT_GPU,
     restore_format=True,
+    static_threshold: float | None = None,
 ):
     preset = preset.lower()
 
@@ -138,6 +175,7 @@ def interpolate_svp(
         vectors_string,
         smooth_string,
         restore_format,
+        static_threshold,
     )
 
 

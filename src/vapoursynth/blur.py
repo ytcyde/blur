@@ -70,6 +70,9 @@ if settings["timescale"]:
     if settings["input_timescale"] != 1:
         video = u.assume_scaled_fps(video, 1 / input_timescale)
 
+# frames closer than the deduplicate threshold are treated as duplicates
+static_threshold: float | None = None
+
 if settings["deduplicate"] and settings["deduplicate_range"] != 0:
     deduplicate_range: int | None = int(settings["deduplicate_range"])
     if deduplicate_range == -1:  # -1 = infinite
@@ -79,6 +82,8 @@ if settings["deduplicate"] and settings["deduplicate_range"] != 0:
         deduplicate_threshold = float(settings["deduplicate_threshold"])
     except (ValueError, TypeError, KeyError):
         deduplicate_threshold = 0.001
+
+    static_threshold = deduplicate_threshold
 
     match settings["deduplicate_method"]:
         case "old":
@@ -217,6 +222,7 @@ if settings["interpolate"]:
                         masking=interpolation_mask_area,
                         gpu=settings["gpu_interpolation"],
                         restore_format=False,
+                        static_threshold=static_threshold,
                     )
                 else:
                     # insert interpolated fps
@@ -232,6 +238,7 @@ if settings["interpolate"]:
                         vectors_string=settings["vectors_string"],
                         smooth_str=smooth_str,
                         restore_format=False,
+                        static_threshold=static_threshold,
                     )
 
         fps_added = video.fps - old_fps
