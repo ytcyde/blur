@@ -3,6 +3,7 @@ from vapoursynth import core
 
 import sys
 import json
+from fractions import Fraction
 from pathlib import Path
 
 # add blur.py folder to path so it can reference scripts
@@ -70,8 +71,107 @@ if settings["timescale"]:
     if settings["input_timescale"] != 1:
         video = u.assume_scaled_fps(video, 1 / input_timescale)
 
+
+def parse_fps_setting(setting_key):
+    fps_value = settings[setting_key].strip()
+
+    if fps_value.endswith("x"):
+        # ends with x, is a multiplier (e.g. 5x)
+        multiplier_str = fps_value[:-1].strip()
+        if not multiplier_str:
+            raise u.BlurException(
+                f"Invalid FPS multiplier {setting_key}: '{fps_value}'. Should be something like 5x."
+            )
+
+        try:
+            multiplier = float(multiplier_str)
+        except ValueError:
+            raise u.BlurException(
+                f"Invalid FPS multiplier {setting_key}: '{fps_value}'. Should be something like 5x. Do you have non-number characters before the final x?"
+            )
+
+        return video.fps * multiplier
+
+    else:
+        # doesn't end with x, is an fps (e.g. 600)
+        try:
+            return int(fps_value)
+        except ValueError:
+            raise u.BlurException(
+                f"Invalid FPS {setting_key}: '{fps_value}' - failed to parse it as an integer. Is it an integer?"
+            )
+
+
+def get_blur_weights(fps):
+    # how many frames apart the output frames are, and the weights of the frames blended into each
+    if not settings["blur"] or settings["blur_amount"] <= 0:
+        return None
+
+    frame_gap = int(fps / settings["blur_output_fps"])
+    blur_frames = int(frame_gap * settings["blur_amount"])
+    if blur_frames <= 0:
+        return None
+
+    # number of weights must be odd
+    if blur_frames % 2 == 0:
+        blur_frames += 1
+
+    weights = blur.weighting.parse(
+        blur_frames,
+        weighting_type=settings["blur_weighting"],
+        gaussian_std_dev=settings["blur_weighting_gaussian_std_dev"],
+        gaussian_mean=settings["blur_weighting_gaussian_mean"],
+        gaussian_bound=json.loads(settings["blur_weighting_gaussian_bound"]),
+    )
+
+    return frame_gap, weights
+
+
+def get_blended_render(interpolated_fps):
+    # when the interpolated frames only exist to be blended into the output frames, both steps can
+    # be done in one go on the gpu. returns the arguments for that, or None if it's not possible
+    if not settings["interpolate"] or settings["interpolation_method"] == "rife":
+        return None
+
+    if settings["manual_svp"] or not settings["gpu_interpolation"]:
+        return None
+
+    if video.fps >= interpolated_fps:
+        return None
+
+    # the renderer does what svp does at these settings
+    if svp_interpolation_algorithm != 13 or interpolation_mask_area != 0:
+        return None
+
+    if float(settings["blur_gamma"]) != 1.0:
+        return None
+
+    if settings["timescale"] and float(settings["output_timescale"]) != 1:
+        return None
+
+    factor = Fraction(interpolated_fps) / video.fps
+    step = Fraction(interpolated_fps) / Fraction(settings["blur_output_fps"])
+    if factor.denominator != 1 or step.denominator != 1:
+        return None
+
+    blend = get_blur_weights(interpolated_fps)
+    if blend is None or not blur.interpolate.has_blurflow():
+        return None
+
+    return dict(
+        factor=int(factor),
+        step=int(step),
+        weights=blend[1],
+        static_threshold=static_threshold,
+        fill_drops=renderer_fills_drops,
+    )
+
+
 # frames closer than the deduplicate threshold are treated as duplicates
 static_threshold: float | None = None
+
+# the gpu renderer can fill dropped frames itself, by interpolating straight across them
+renderer_fills_drops = False
 
 if settings["deduplicate"] and settings["deduplicate_range"] != 0:
     deduplicate_range: int | None = int(settings["deduplicate_range"])
@@ -87,11 +187,19 @@ if settings["deduplicate"] and settings["deduplicate_range"] != 0:
 
     match settings["deduplicate_method"]:
         case "old":
-            video = blur.deduplicate.fill_drops_old(
-                video,
-                threshold=deduplicate_threshold,
-                debug=settings["debug"],
+            renderer_fills_drops = (
+                settings["interpolate"]
+                and not settings["debug"]
+                and not settings["pre_interpolate"]
+                and get_blended_render(parse_fps_setting("interpolated_fps")) is not None
             )
+
+            if not renderer_fills_drops:
+                video = blur.deduplicate.fill_drops_old(
+                    video,
+                    threshold=deduplicate_threshold,
+                    debug=settings["debug"],
+                )
 
         case "svp":
             video = blur.deduplicate.fill_drops_multiple(
@@ -128,37 +236,11 @@ def restore_source_format(video):
     return u.convert_format(video, is_full_color_range, source_format)
 
 
+# set once the video has been blurred as part of interpolating it
+blurred = False
+
 # interpolation
 if settings["interpolate"]:
-
-    def parse_fps_setting(setting_key):
-        fps_value = settings[setting_key].strip()
-
-        if fps_value.endswith("x"):
-            # ends with x, is a multiplier (e.g. 5x)
-            multiplier_str = fps_value[:-1].strip()
-            if not multiplier_str:
-                raise u.BlurException(
-                    f"Invalid FPS multiplier {setting_key}: '{fps_value}'. Should be something like 5x."
-                )
-
-            try:
-                multiplier = float(multiplier_str)
-            except ValueError:
-                raise u.BlurException(
-                    f"Invalid FPS multiplier {setting_key}: '{fps_value}'. Should be something like 5x. Do you have non-number characters before the final x?"
-                )
-
-            return video.fps * multiplier
-
-        else:
-            # doesn't end with x, is an fps (e.g. 600)
-            try:
-                return int(fps_value)
-            except ValueError:
-                raise u.BlurException(
-                    f"Invalid FPS {setting_key}: '{fps_value}' - failed to parse it as an integer. Is it an integer?"
-                )
 
     interpolated_fps = parse_fps_setting("interpolated_fps")
 
@@ -210,7 +292,29 @@ if settings["interpolate"]:
             #     )
 
             case _:  # svp
-                if not settings["manual_svp"]:
+                blended_render = get_blended_render(interpolated_fps)
+
+                if blended_render is not None:
+                    try:
+                        video = blur.interpolate.render_blended(
+                            video,
+                            is_full_color_range=is_full_color_range,
+                            preset=settings["svp_interpolation_preset"],
+                            blocksize=interpolation_blocksize,
+                            **blended_render,
+                        )
+                        blurred = True
+                    except vs.Error as e:
+                        print(f"gpu renderer unavailable, using svp ({e})")
+
+                        if renderer_fills_drops:
+                            video = blur.deduplicate.fill_drops_old(
+                                video, threshold=static_threshold
+                            )
+
+                if blurred:
+                    pass
+                elif not settings["manual_svp"]:
                     video = blur.interpolate.interpolate_svp(
                         video,
                         is_full_color_range=is_full_color_range,
@@ -241,10 +345,11 @@ if settings["interpolate"]:
                         static_threshold=static_threshold,
                     )
 
-        fps_added = video.fps - old_fps
-        print(
-            f"added {fps_added} (interp: {interpolated_fps}. video.fps: {video.fps}/{interpolated_fps})"
-        )
+        if not blurred:
+            fps_added = video.fps - old_fps
+            print(
+                f"added {fps_added} (interp: {interpolated_fps}. video.fps: {video.fps}/{interpolated_fps})"
+            )
 
 # output timescale
 if settings["timescale"]:
@@ -253,31 +358,19 @@ if settings["timescale"]:
         video = u.assume_scaled_fps(video, output_timescale)
 
 # blurring
-if settings["blur"]:
-    if settings["blur_amount"] > 0:
-        frame_gap = int(video.fps / settings["blur_output_fps"])
-        blur_frames = int(frame_gap * settings["blur_amount"])
+if settings["blur"] and not blurred:
+    blend = get_blur_weights(video.fps)
 
-        if blur_frames > 0:
-            # number of weights must be odd
-            if blur_frames % 2 == 0:
-                blur_frames += 1
+    if blend is not None:
+        _, weights = blend
 
-            weights = blur.weighting.parse(
-                blur_frames,
-                weighting_type=settings["blur_weighting"],
-                gaussian_std_dev=settings["blur_weighting_gaussian_std_dev"],
-                gaussian_mean=settings["blur_weighting_gaussian_mean"],
-                gaussian_bound=json.loads(settings["blur_weighting_gaussian_bound"]),
+        gamma = float(settings["blur_gamma"])
+        if gamma == 1.0:
+            video = blur.blending.average(video, weights)
+        else:
+            video = blur.blending.average_bright(
+                restore_source_format(video), is_full_color_range, gamma, weights
             )
-
-            gamma = float(settings["blur_gamma"])
-            if gamma == 1.0:
-                video = blur.blending.average(video, weights)
-            else:
-                video = blur.blending.average_bright(
-                    restore_source_format(video), is_full_color_range, gamma, weights
-                )
 
     # set exact fps
     video = blur.interpolate.change_fps(video, settings["blur_output_fps"])

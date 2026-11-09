@@ -76,6 +76,12 @@ target_compile_definitions(
                      BOOST_FILESYSTEM_STATIC_LINK=1 SPDLOG_NO_EXCEPTIONS)
 
 # common settings
+if(WIN32)
+  # gpu renderer plugin for the vapoursynth scripts, which load it from next to
+  # themselves
+  add_subdirectory(src/vsplugin/blurflow)
+endif()
+
 function(setup_target target)
   target_include_directories(${target} PRIVATE src)
   target_link_libraries(
@@ -114,6 +120,15 @@ function(setup_target target)
     COMMAND ${CMAKE_COMMAND} -E make_directory ${BUILD_RESOURCES_DIR}/lib
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${PROJECT_SOURCE_DIR}/src/vapoursynth" ${BUILD_RESOURCES_DIR}/lib)
+
+  if(TARGET blurflow)
+    add_dependencies(${target} blurflow)
+    add_custom_command(
+      TARGET ${target}
+      POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:blurflow>
+              ${BUILD_RESOURCES_DIR}/lib)
+  endif()
 endfunction()
 
 if(CMAKE_BUILD_TYPE STREQUAL Debug)

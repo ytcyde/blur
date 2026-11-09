@@ -5,6 +5,7 @@ from vapoursynth import core
 
 import json
 import math
+from pathlib import Path
 
 import blur.utils as u
 
@@ -111,6 +112,61 @@ def svp(
 
     return u.with_format(
         _video, is_full_color_range, vs.YUV420P8, process, restore_format
+    )
+
+
+def has_blurflow():
+    if hasattr(core, "blurflow"):
+        return True
+
+    # not in vapoursynth's plugin folder, it may be sitting next to the scripts instead
+    for plugin in Path(__file__).parent.parent.glob("blurflow.*"):
+        try:
+            core.std.LoadPlugin(path=str(plugin))
+            return True
+        except vs.Error:
+            pass
+
+    return False
+
+
+def render_blended(
+    _video: vs.VideoNode,
+    is_full_color_range: bool,
+    factor: int,
+    step: int,
+    weights: list[float],
+    preset=DEFAULT_PRESET,
+    blocksize=DEFAULT_BLOCKSIZE,
+    static_threshold: float | None = None,
+    fill_drops=False,
+):
+    # interpolates to `factor` times the framerate with svp's vectors and blends every `step`th run
+    # of len(weights) frames, all on the gpu. this gives what svp + blending + picking frames would,
+    # without reading back every interpolated frame just to average them.
+    #
+    # with fill_drops a frame that repeats the one before it and is followed by a new one is taken
+    # to be a dropped frame, and the interpolation towards the new frame runs across it
+    [super_string, vectors_string, _] = generate_svp_strings(
+        0, preset, blocksize=blocksize, overlap=0
+    )
+
+    def process(video):
+        super = core.svp1.Super(video, super_string)
+        vectors = core.svp1.Analyse(super["clip"], super["data"], video, vectors_string)
+
+        args = {}
+        if static_threshold is not None:
+            args["threshold"] = static_threshold
+            args["hold"] = factor >= 2  # same as hold_static_intervals
+            args["fill"] = fill_drops
+
+        return core.blurflow.Render(
+            video, vectors["clip"], factor=factor, step=step, weights=weights, **args
+        )
+
+    return u.with_format(
+        _video, is_full_color_range, vs.YUV420P8, process, restore_format=False
     )
 
 
