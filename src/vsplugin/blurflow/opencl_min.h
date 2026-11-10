@@ -39,6 +39,9 @@ constexpr cl_bitfield CL_DEVICE_TYPE_GPU = 1 << 2;
 constexpr cl_uint CL_DEVICE_NAME = 0x102B;
 constexpr cl_bitfield CL_MEM_READ_WRITE = 1 << 0;
 constexpr cl_bitfield CL_MEM_READ_ONLY = 1 << 2;
+constexpr cl_bitfield CL_MEM_ALLOC_HOST_PTR = 1 << 4;
+constexpr cl_bitfield CL_MAP_READ = 1 << 0;
+constexpr cl_bitfield CL_MAP_WRITE = 1 << 1;
 constexpr cl_uint CL_R = 0x10B0;
 constexpr cl_uint CL_RGBA = 0x10B5;
 constexpr cl_uint CL_UNORM_INT8 = 0x10D2;
@@ -68,6 +71,9 @@ constexpr cl_uint CL_PROGRAM_BUILD_LOG = 0x1183;
 	  (cl_command_queue, cl_mem, cl_bool, size_t, size_t, const void*, cl_uint, const cl_event*, cl_event*))           \
 	X(cl_int, clEnqueueReadBuffer,                                                                                     \
 	  (cl_command_queue, cl_mem, cl_bool, size_t, size_t, void*, cl_uint, const cl_event*, cl_event*))                 \
+	X(void*, clEnqueueMapBuffer,                                                                                       \
+	  (cl_command_queue, cl_mem, cl_bool, cl_bitfield, size_t, size_t, cl_uint, const cl_event*, cl_event*, cl_int*))  \
+	X(cl_int, clEnqueueUnmapMemObject, (cl_command_queue, cl_mem, void*, cl_uint, const cl_event*, cl_event*))         \
 	X(cl_int, clFlush, (cl_command_queue))                                                                             \
 	X(cl_int, clFinish, (cl_command_queue))                                                                            \
 	X(cl_int, clReleaseMemObject, (cl_mem))                                                                            \

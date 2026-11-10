@@ -106,16 +106,45 @@ namespace {
 		return layout;
 	}
 
+	// host memory the driver can transfer to and from the gpu directly. transfers from ordinary
+	// memory get copied by the driver first, which costs several times what the copy here does
+	struct PinnedBuffer {
+		cl_mem buffer = nullptr;
+		uint8_t* data = nullptr;
+
+		void create(cl_context context, cl_command_queue queue, size_t size) {
+			auto& cl = opencl();
+			cl_int err;
+			buffer = cl.clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, size, nullptr, &err);
+			check(err, "clCreateBuffer");
+			data = static_cast<uint8_t*>(cl.clEnqueueMapBuffer(
+				queue, buffer, CL_TRUE, CL_MAP_READ | CL_MAP_WRITE, 0, size, 0, nullptr, nullptr, &err
+			));
+			check(err, "clEnqueueMapBuffer");
+		}
+
+		void destroy(cl_command_queue queue) {
+			auto& cl = opencl();
+			if (data)
+				cl.clEnqueueUnmapMemObject(queue, buffer, data, 0, nullptr, nullptr);
+			if (buffer)
+				cl.clReleaseMemObject(buffer);
+		}
+	};
+
 	struct FrameSlot {
 		int n = -1;
 		uint64_t used = 0;
-		cl_mem planes[3] = {};
+		PinnedBuffer staging;
+		cl_mem image = nullptr; // the chroma planes side by side under the luma plane
 		cl_mem linear_luma = nullptr;
+		bool has_linear_luma = false; // only worked out once something is interpolated from the frame
 	};
 
 	struct VectorSlot {
 		int n = -1;
 		uint64_t used = 0;
+		PinnedBuffer staging;
 		cl_mem texture = nullptr;
 	};
 
@@ -150,7 +179,8 @@ namespace {
 		int width;
 		int height;
 		int base; // offset into the accumulation and output buffers
-		int ratio; // subsampling relative to luma
+		int image_x; // where it sits in a frame's image
+		int image_y;
 	};
 
 	struct Renderer {
@@ -195,7 +225,7 @@ namespace {
 		bool have_layout = false;
 		uint64_t tick = 0;
 
-		std::vector<uint8_t> scratch;
+		PinnedBuffer readback;
 
 		~Renderer() {
 			auto& cl = opencl();
@@ -206,12 +236,15 @@ namespace {
 				cl.clFinish(queue);
 
 			for (auto& slot : frame_slots) {
-				for (cl_mem plane : slot.planes)
-					release(plane);
+				slot.staging.destroy(queue);
+				release(slot.image);
 				release(slot.linear_luma);
 			}
-			for (auto& slot : vector_slots)
+			readback.destroy(queue);
+			for (auto& slot : vector_slots) {
+				slot.staging.destroy(queue);
 				release(slot.texture);
+			}
 			release(accumulator);
 			release(output);
 			release(weights_buffer);
@@ -232,6 +265,14 @@ namespace {
 		static void release(cl_mem mem) {
 			if (mem)
 				opencl().clReleaseMemObject(mem);
+		}
+
+		[[nodiscard]] int image_width() const {
+			return planes[0].width;
+		}
+
+		[[nodiscard]] int image_height() const {
+			return planes[0].height + planes[1].height;
 		}
 
 		[[nodiscard]] int window_frames() const {
@@ -291,13 +332,13 @@ namespace {
 			const cl_image_format plane_format = { CL_R, CL_UNORM_INT8 };
 			const cl_image_format linear_format = { CL_R, CL_FLOAT };
 			frame_slots.resize(window_frames() + 4);
+			readback.create(context, queue, buffer_size);
 			for (auto& slot : frame_slots) {
-				for (int p = 0; p < 3; p++) {
-					slot.planes[p] = cl.clCreateImage2D(
-						context, CL_MEM_READ_ONLY, &plane_format, planes[p].width, planes[p].height, 0, nullptr, &err
-					);
-					check(err, "clCreateImage2D");
-				}
+				slot.staging.create(context, queue, (size_t)image_width() * image_height());
+				slot.image = cl.clCreateImage2D(
+					context, CL_MEM_READ_ONLY, &plane_format, image_width(), image_height(), 0, nullptr, &err
+				);
+				check(err, "clCreateImage2D");
 				slot.linear_luma = cl.clCreateImage2D(
 					context, CL_MEM_READ_WRITE, &linear_format, planes[0].width, planes[0].height, 0, nullptr, &err
 				);
@@ -482,9 +523,7 @@ namespace {
 			return *oldest;
 		}
 
-		FrameSlot& frame_slot(
-			int n, std::vector<const VSFrame*>& held, VSFrameContext* frame_ctx, const VSAPI* vsapi
-		) {
+		FrameSlot& frame_slot(int n, VSFrameContext* frame_ctx, const VSAPI* vsapi) {
 			bool hit;
 			FrameSlot& slot = claim(frame_slots, n, tick, hit);
 			if (hit)
@@ -492,43 +531,55 @@ namespace {
 
 			auto& cl = opencl();
 			const VSFrame* frame = vsapi->getFrameFilter(n, clip, frame_ctx);
-			held.push_back(frame); // the uploads read from it until the queue has run
+
+			int pitch = image_width();
 
 			for (int p = 0; p < 3; p++) {
-				const size_t origin[3] = { 0, 0, 0 };
-				const size_t region[3] = { (size_t)planes[p].width, (size_t)planes[p].height, 1 };
-				check(
-					cl.clEnqueueWriteImage(
-						queue,
-						slot.planes[p],
-						CL_FALSE,
-						origin,
-						region,
-						(size_t)vsapi->getStride(frame, p),
-						0,
-						vsapi->getReadPtr(frame, p),
-						0,
-						nullptr,
-						nullptr
-					),
-					"clEnqueueWriteImage"
-				);
+				const Plane& plane = planes[p];
+				const uint8_t* src = vsapi->getReadPtr(frame, p);
+				ptrdiff_t stride = vsapi->getStride(frame, p);
+				uint8_t* staged = slot.staging.data + (size_t)plane.image_y * pitch + plane.image_x;
+
+				if (stride == pitch && plane.width == pitch) {
+					memcpy(staged, src, (size_t)pitch * plane.height);
+				}
+				else {
+					for (int y = 0; y < plane.height; y++)
+						memcpy(staged + (size_t)y * pitch, src + y * stride, plane.width);
+				}
 			}
 
+			const size_t origin[3] = { 0, 0, 0 };
+			const size_t region[3] = { (size_t)image_width(), (size_t)image_height(), 1 };
+			check(
+				cl.clEnqueueWriteImage(
+					queue, slot.image, CL_FALSE, origin, region, (size_t)pitch, 0, slot.staging.data, 0, nullptr, nullptr
+				),
+				"clEnqueueWriteImage"
+			);
+
+			vsapi->freeFrame(frame);
+
+			slot.has_linear_luma = false;
+			return slot;
+		}
+
+		void need_linear_luma(FrameSlot& slot) {
+			if (slot.has_linear_luma)
+				return;
+
+			auto& cl = opencl();
 			const size_t size[2] = { (size_t)planes[0].width, (size_t)planes[0].height };
-			check(cl.clSetKernelArg(to_linear, 0, sizeof(cl_mem), &slot.planes[0]), "clSetKernelArg");
+			check(cl.clSetKernelArg(to_linear, 0, sizeof(cl_mem), &slot.image), "clSetKernelArg");
 			check(cl.clSetKernelArg(to_linear, 1, sizeof(cl_mem), &slot.linear_luma), "clSetKernelArg");
 			check(
 				cl.clEnqueueNDRangeKernel(queue, to_linear, 2, nullptr, size, nullptr, 0, nullptr, nullptr),
 				"clEnqueueNDRangeKernel"
 			);
-
-			return slot;
+			slot.has_linear_luma = true;
 		}
 
-		VectorSlot& vector_slot(
-			int n, std::vector<std::vector<uint16_t>>& uploads, VSFrameContext* frame_ctx, const VSAPI* vsapi
-		) {
+		VectorSlot& vector_slot(int n, VSFrameContext* frame_ctx, const VSAPI* vsapi) {
 			const VSFrame* frame = vsapi->getFrameFilter(n, vectors, frame_ctx);
 			std::unique_ptr<const VSFrame, void (*)(const VSFrame*)> frame_guard(frame, vsapi->freeFrame);
 
@@ -542,8 +593,10 @@ namespace {
 				have_layout = true;
 
 				vector_slots.resize(window_frames() + 3);
-				for (auto& slot : vector_slots)
+				for (auto& slot : vector_slots) {
+					slot.staging.create(context, queue, (size_t)layout.blocks_x * layout.blocks_y * 4 * sizeof(uint16_t));
 					slot.texture = create_vector_texture(layout.blocks_x, layout.blocks_y);
+				}
 			}
 			else if (frame_layout != layout) {
 				throw std::runtime_error("vector frame layout changed");
@@ -558,7 +611,7 @@ namespace {
 			// vectors are stored offset by 1024 so that they fit an unsigned texture. past the last block
 			// the texture clamps, which is how svp extends the block grid to the frame's edge
 			constexpr uint16_t ZERO = 1024;
-			auto& texels = uploads.emplace_back((size_t)layout.blocks_x * layout.blocks_y * 4);
+			auto* texels = reinterpret_cast<uint16_t*>(slot.staging.data);
 
 			const uint8_t* first = data + VectorLayout::HEADER_SIZE + sizeof(int32_t);
 			const uint8_t* second = first + layout.direction_size();
@@ -583,7 +636,7 @@ namespace {
 			const size_t region[3] = { (size_t)layout.blocks_x, (size_t)layout.blocks_y, 1 };
 			check(
 				opencl().clEnqueueWriteImage(
-					queue, slot.texture, CL_FALSE, origin, region, 0, 0, texels.data(), 0, nullptr, nullptr
+					queue, slot.texture, CL_FALSE, origin, region, 0, 0, texels, 0, nullptr, nullptr
 				),
 				"clEnqueueWriteImage"
 			);
@@ -598,25 +651,19 @@ namespace {
 			if (passes.empty())
 				throw std::runtime_error("nothing to render");
 
-			// everything the queued commands read from has to stay alive until the final read returns
-			std::vector<const VSFrame*> held;
-			std::vector<std::vector<uint16_t>> vector_uploads;
+			// has to stay alive until the final read returns, as the queued commands read from it
 			std::vector<float> pass_weights;
 			std::vector<size_t> weights_at;
 
 			struct Guard {
-				std::vector<const VSFrame*>& held;
 				cl_command_queue queue;
-				const VSAPI* vsapi;
 				bool finished = false;
 
 				~Guard() {
 					if (!finished)
 						opencl().clFinish(queue);
-					for (const VSFrame* frame : held)
-						vsapi->freeFrame(frame);
 				}
-			} guard{ held, queue, vsapi };
+			} guard{ queue };
 
 			tick++;
 
@@ -646,57 +693,60 @@ namespace {
 
 				bool interpolated = pass.interpolated();
 
-				FrameSlot& first = frame_slot(pass.first, held, frame_ctx, vsapi);
-				FrameSlot& second = pass.uses_second() ? frame_slot(pass.second, held, frame_ctx, vsapi) : first;
-				cl_mem vector_texture =
-					interpolated ? vector_slot(pass.vectors, vector_uploads, frame_ctx, vsapi).texture : no_vectors;
-
-				for (int p = 0; p < 3; p++) {
-					const Plane& plane = planes[p];
-					bool luma = p == 0;
-
-					cl_int base = plane.base;
-					cl_int weights_offset = (cl_int)weights_at[i];
-					cl_int steps = (cl_int)pass.weights.size();
-					float tail = (float)pass.tail;
-					float divisor = (float)weight_sum;
-					cl_int ratio = plane.ratio;
-					float block_w = have_layout ? (float)layout.block_w : 1.0f;
-					float block_h = have_layout ? (float)layout.block_h : 1.0f;
-					float vector_div = (float)(plane.ratio * (have_layout ? layout.pel : 1)) * 256.0f;
-					cl_int flags = (i == 0 ? 1 : 0) | (i == passes.size() - 1 ? 2 : 0) | (luma ? 4 : 0) |
-					               (interpolated ? 8 : 0);
-
-					cl_uint arg = 0;
-					auto set = [&](size_t size, const void* value) {
-						check(cl.clSetKernelArg(interval, arg++, size, value), "clSetKernelArg");
-					};
-
-					set(sizeof(cl_mem), &accumulator);
-					set(sizeof(cl_mem), &output);
-					set(sizeof(base), &base);
-					set(sizeof(cl_mem), &first.planes[p]);
-					set(sizeof(cl_mem), &second.planes[p]);
-					set(sizeof(cl_mem), luma ? &first.linear_luma : &first.planes[p]);
-					set(sizeof(cl_mem), luma ? &second.linear_luma : &second.planes[p]);
-					set(sizeof(cl_mem), &vector_texture);
-					set(sizeof(cl_mem), &weights_buffer);
-					set(sizeof(weights_offset), &weights_offset);
-					set(sizeof(steps), &steps);
-					set(sizeof(tail), &tail);
-					set(sizeof(divisor), &divisor);
-					set(sizeof(ratio), &ratio);
-					set(sizeof(block_w), &block_w);
-					set(sizeof(block_h), &block_h);
-					set(sizeof(vector_div), &vector_div);
-					set(sizeof(flags), &flags);
-
-					const size_t size[2] = { (size_t)plane.width, (size_t)plane.height };
-					check(
-						cl.clEnqueueNDRangeKernel(queue, interval, 2, nullptr, size, nullptr, 0, nullptr, nullptr),
-						"clEnqueueNDRangeKernel"
-					);
+				FrameSlot& first = frame_slot(pass.first, frame_ctx, vsapi);
+				FrameSlot& second = pass.uses_second() ? frame_slot(pass.second, frame_ctx, vsapi) : first;
+				cl_mem vector_texture = no_vectors;
+				if (interpolated) {
+					vector_texture = vector_slot(pass.vectors, frame_ctx, vsapi).texture;
+					need_linear_luma(first);
+					need_linear_luma(second);
 				}
+
+				cl_int weights_offset = (cl_int)weights_at[i];
+				cl_int steps = (cl_int)pass.weights.size();
+				float tail = (float)pass.tail;
+				float divisor = (float)weight_sum;
+				cl_int width = planes[0].width;
+				cl_int height = planes[0].height;
+				cl_int chroma_w = planes[1].width;
+				cl_int chroma_h = planes[1].height;
+				float block_w = have_layout ? (float)layout.block_w : 1.0f;
+				float block_h = have_layout ? (float)layout.block_h : 1.0f;
+				float pel = have_layout ? (float)layout.pel : 1.0f;
+				cl_int flags = (i == 0 ? 1 : 0) | (i == passes.size() - 1 ? 2 : 0) | (interpolated ? 8 : 0);
+
+				cl_uint arg = 0;
+				auto set = [&](size_t size, const void* value) {
+					check(cl.clSetKernelArg(interval, arg++, size, value), "clSetKernelArg");
+				};
+
+				set(sizeof(cl_mem), &accumulator);
+				set(sizeof(cl_mem), &output);
+				set(sizeof(cl_mem), &first.image);
+				set(sizeof(cl_mem), &second.image);
+				set(sizeof(cl_mem), &first.linear_luma);
+				set(sizeof(cl_mem), &second.linear_luma);
+				set(sizeof(cl_mem), &vector_texture);
+				set(sizeof(cl_mem), &weights_buffer);
+				set(sizeof(weights_offset), &weights_offset);
+				set(sizeof(steps), &steps);
+				set(sizeof(tail), &tail);
+				set(sizeof(divisor), &divisor);
+				set(sizeof(width), &width);
+				set(sizeof(height), &height);
+				set(sizeof(chroma_w), &chroma_w);
+				set(sizeof(chroma_h), &chroma_h);
+				set(sizeof(block_w), &block_w);
+				set(sizeof(block_h), &block_h);
+				set(sizeof(pel), &pel);
+				set(sizeof(flags), &flags);
+
+				// one run covers the whole image, so all three planes
+				const size_t size[2] = { (size_t)image_width(), (size_t)image_height() };
+				check(
+					cl.clEnqueueNDRangeKernel(queue, interval, 2, nullptr, size, nullptr, 0, nullptr, nullptr),
+					"clEnqueueNDRangeKernel"
+				);
 			}
 
 			const VSFrame* prop_src = vsapi->getFrameFilter(passes[0].first, clip, frame_ctx);
@@ -707,53 +757,31 @@ namespace {
 			vsapi->mapSetInt(props, "_DurationNum", vi.fpsDen, maReplace);
 			vsapi->mapSetInt(props, "_DurationDen", vi.fpsNum, maReplace);
 
-			// read straight into the frame where its rows are packed, which they normally are
-			size_t scratch_needed = 0;
-			for (int p = 0; p < 3; p++) {
-				if (vsapi->getStride(dst, p) != planes[p].width)
-					scratch_needed = buffer_size;
-			}
-			scratch.resize(scratch_needed);
-
 			try {
-				for (int p = 0; p < 3; p++) {
-					const Plane& plane = planes[p];
-					bool packed = vsapi->getStride(dst, p) == plane.width;
-					uint8_t* target = packed ? vsapi->getWritePtr(dst, p) : scratch.data() + plane.base;
-
-					check(
-						cl.clEnqueueReadBuffer(
-							queue,
-							output,
-							p == 2 ? CL_TRUE : CL_FALSE,
-							(size_t)plane.base,
-							(size_t)plane.width * plane.height,
-							target,
-							0,
-							nullptr,
-							nullptr
-						),
-						"clEnqueueReadBuffer"
-					);
-				}
+				check(
+					cl.clEnqueueReadBuffer(queue, output, CL_TRUE, 0, buffer_size, readback.data, 0, nullptr, nullptr),
+					"clEnqueueReadBuffer"
+				);
 				guard.finished = true;
 			}
 			catch (...) {
-				cl.clFinish(queue);
-				guard.finished = true;
 				vsapi->freeFrame(dst);
 				throw;
 			}
 
 			for (int p = 0; p < 3; p++) {
 				const Plane& plane = planes[p];
-				ptrdiff_t stride = vsapi->getStride(dst, p);
-				if (stride == plane.width)
-					continue;
-
+				const uint8_t* in = readback.data + plane.base;
 				uint8_t* out = vsapi->getWritePtr(dst, p);
-				for (int y = 0; y < plane.height; y++)
-					memcpy(out + y * stride, scratch.data() + plane.base + (size_t)y * plane.width, plane.width);
+				ptrdiff_t stride = vsapi->getStride(dst, p);
+
+				if (stride == plane.width) {
+					memcpy(out, in, (size_t)plane.width * plane.height);
+				}
+				else {
+					for (int y = 0; y < plane.height; y++)
+						memcpy(out + y * stride, in + (size_t)y * plane.width, plane.width);
+				}
 			}
 
 			return dst;
@@ -901,9 +929,11 @@ namespace {
 
 		int w = clip_vi->width;
 		int h = clip_vi->height;
-		r->planes[0] = { .width = w, .height = h, .base = 0, .ratio = 1 };
-		r->planes[1] = { .width = w / 2, .height = h / 2, .base = w * h, .ratio = 2 };
-		r->planes[2] = { .width = w / 2, .height = h / 2, .base = w * h + (w / 2) * (h / 2), .ratio = 2 };
+		r->planes[0] = { .width = w, .height = h, .base = 0, .image_x = 0, .image_y = 0 };
+		r->planes[1] = { .width = w / 2, .height = h / 2, .base = w * h, .image_x = 0, .image_y = h };
+		r->planes[2] = {
+			.width = w / 2, .height = h / 2, .base = w * h + (w / 2) * (h / 2), .image_x = w / 2, .image_y = h
+		};
 		r->buffer_size = (size_t)w * h + 2 * (size_t)(w / 2) * (h / 2);
 
 		try {
