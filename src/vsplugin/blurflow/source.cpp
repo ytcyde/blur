@@ -798,17 +798,21 @@ namespace {
 			}
 		}
 
-		// output frame n, or nullptr when it has to come from the fallback instead
-		const VSFrame* get(int n, VSCore* core, const VSAPI* vsapi) {
-			if (rejected)
-				return nullptr;
-
-			// a clip that's never read from doesn't decode anything
+		void start() {
 			std::call_once(start_once, [&] {
 				thread = std::thread([this] {
 					run();
 				});
 			});
+		}
+
+		// output frame n, or nullptr when it has to come from the fallback instead
+		const VSFrame* get(int n, VSCore* core, const VSAPI* vsapi) {
+			if (rejected)
+				return nullptr;
+
+			// unless it was told to get going, a clip that's never read from doesn't decode anything
+			start();
 
 			int frame = frame_map[n];
 			Buffer* buffer = nullptr;
@@ -1026,6 +1030,10 @@ namespace {
 
 		s->buffers.resize(HELD_FRAMES);
 
+		// setting the decoder up takes a moment, which can pass while the rest of the script is run
+		if (vsapi->mapGetInt(in, "start", 0, &err) != 0)
+			s->start();
+
 		const VSFilterDependency deps[] = { { s->fallback, rpGeneral } };
 		const VSVideoInfo vi = s->vi;
 		vsapi->createVideoFilter(out, "Source", &vi, get_frame, free_source, fmParallel, deps, 1, s.release(), core);
@@ -1035,7 +1043,7 @@ namespace {
 void register_source_filter(VSPlugin* plugin, const VSPLUGINAPI* vspapi) {
 	vspapi->registerFunction(
 		"Source",
-		"fallback:vnode;command:data[];frames:int[];order:int[];codec:data;subsample:int:opt;",
+		"fallback:vnode;command:data[];frames:int[];order:int[];codec:data;subsample:int:opt;start:int:opt;",
 		"clip:vnode;",
 		create,
 		nullptr,

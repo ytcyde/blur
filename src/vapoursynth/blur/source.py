@@ -26,14 +26,35 @@ def find_tool(name: str):
     return shutil.which(name)
 
 
-def run(command: list[str]):
-    return subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        stdin=subprocess.DEVNULL,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+def probe_packets(video_path: Path):
+    # starts listing the video's packets, for gpu_decoded. that takes a while for a long video,
+    # so it's left running while the video is opened
+    ffprobe = find_tool("ffprobe")
+    if not ffprobe:
+        return None
+
+    try:
+        return subprocess.Popen(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,pix_fmt,time_base:packet=pts,flags",
+                "-of",
+                "csv=nokey=0",
+                str(video_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError:
+        return None
 
 
 def cfr_frame_map(
@@ -92,10 +113,24 @@ def cfr_frame_map(
     return [stand_in[frame] for frame in frame_map]
 
 
-def gpu_decoded(reference: vs.VideoNode, video_path: Path, fps_num: int, fps_den: int):
+def gpu_decoded(
+    reference: vs.VideoNode,
+    video_path: Path,
+    fps_num: int,
+    fps_den: int,
+    probe: subprocess.Popen | None,
+):
     # the same clip as `reference`, decoded by the gpu's own decoder, or None if that can't be
     # done. a regular source filter decodes on the cpu, in competition with everything else that
-    # runs there, and ends up being what the rest of the pipeline waits on
+    # runs there, and ends up being what the rest of the pipeline waits on.
+    # `probe` is what probe_packets started
+    if probe is None:
+        return None
+
+    listing, _ = probe.communicate()
+    if probe.returncode != 0:
+        return None
+
     if fps_num <= 0 or fps_den <= 0:
         return None
 
@@ -103,32 +138,14 @@ def gpu_decoded(reference: vs.VideoNode, video_path: Path, fps_num: int, fps_den
         return None
 
     ffmpeg = find_tool("ffmpeg")
-    ffprobe = find_tool("ffprobe")
-    if not ffmpeg or not ffprobe:
-        return None
-
-    probe = run(
-        [
-            ffprobe,
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=codec_name,pix_fmt,time_base:packet=pts,flags",
-            "-of",
-            "csv=nokey=0",
-            str(video_path),
-        ]
-    )
-    if probe.returncode != 0:
+    if not ffmpeg:
         return None
 
     stream = {}
     packets = []  # in the order they're decoded in
 
     try:
-        for line in probe.stdout.splitlines():
+        for line in listing.splitlines():
             kind, *fields = line.split(",")
             values = dict(field.split("=", 1) for field in fields if "=" in field)
 
@@ -201,18 +218,22 @@ def gpu_decoded(reference: vs.VideoNode, video_path: Path, fps_num: int, fps_den
         except vs.Error:
             return None
 
-    video = source(reference)
-
-    if (
-        video is not None
-        and reference.format.id == vs.YUV444P8
+    can_subsample = (
+        reference.format.id == vs.YUV444P8
         and reference.width % 2 == 0
         and reference.height % 2 == 0
-    ):
+    )
+
+    # a clip that may never be read from, because it's had subsampled instead, only starts
+    # decoding once it is
+    video = source(reference, start=not can_subsample)
+
+    if video is not None and can_subsample:
         # most of what's done with a clip is done in yuv420p8. the decoder can put out what
         # converting the clip to it would give, which is a third less to bring over from the gpu
         u.provide_subsampled(
-            video, lambda: source(core.blurflow.Subsample(reference), subsample=1)
+            video,
+            lambda: source(core.blurflow.Subsample(reference), subsample=1, start=1),
         )
 
     return video
@@ -232,11 +253,13 @@ def open_video(video_path: Path, fps_num, fps_den, gpu_decoding: bool):
             fpsden=fps_den if fps_den != -1 else None,
         )
 
+    probe = probe_packets(video_path) if gpu_decoding else None
+
     video = lsmash(0)
     if not gpu_decoding:
         return video
 
-    decoded = gpu_decoded(video, video_path, fps_num, fps_den)
+    decoded = gpu_decoded(video, video_path, fps_num, fps_den, probe)
     if decoded is not None:
         return decoded
 
