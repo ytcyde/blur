@@ -3,6 +3,8 @@ from vapoursynth import core
 
 from pathlib import Path
 from fractions import Fraction
+from typing import Callable
+import weakref
 
 
 class BlurException(Exception):
@@ -66,6 +68,30 @@ def has_blurflow():
     return False
 
 
+# how to get clips that can be had as yuv420p8 without converting them, for as long as they're around
+subsampled_clips: dict[int, Callable[[], vs.VideoNode | None]] = {}
+
+
+def provide_subsampled(video: vs.VideoNode, get: Callable[[], vs.VideoNode | None]):
+    key = id(video)
+    subsampled_clips[key] = get
+    weakref.finalize(video, subsampled_clips.pop, key, None)
+
+
+def subsampled(video: vs.VideoNode):
+    # what blurflow.Subsample would make of the clip
+    key = id(video)
+
+    if key in subsampled_clips:
+        converted = subsampled_clips[key]()
+        if converted is not None:
+            # there's only need to get it once
+            subsampled_clips[key] = lambda: converted
+            return converted
+
+    return core.blurflow.Subsample(video)
+
+
 def convert_format(video: vs.VideoNode, is_full_color_range: bool, target_format):
     if video.format.id == target_format:
         return video
@@ -80,7 +106,7 @@ def convert_format(video: vs.VideoNode, is_full_color_range: bool, target_format
     ):
         match (video.format.id, target_format):
             case (vs.YUV444P8, vs.YUV420P8):
-                return core.blurflow.Subsample(video)
+                return subsampled(video)
             case (vs.YUV420P8, vs.YUV444P8):
                 return core.blurflow.Upsample(video)
 

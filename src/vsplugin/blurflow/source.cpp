@@ -336,6 +336,13 @@ namespace {
 		}
 	};
 
+	// what the decoder's pictures are, next to the clip's frames
+	enum class Chroma {
+		SAME, // 4:4:4, like the clip
+		INTERLEAVED, // 4:2:0 like the clip, which the decoder puts out with its two chroma planes interleaved
+		HALVED, // 4:4:4, of which the clip has every other chroma sample
+	};
+
 	struct Buffer {
 		uint8_t* data = nullptr; // the frame's planes, one after another
 		int frame = -1;
@@ -348,7 +355,7 @@ namespace {
 		VSVideoInfo vi = {};
 		std::wstring command_line;
 		bool hevc = false;
-		bool subsampled = false; // 4:2:0, which the decoder puts out with its chroma planes interleaved
+		Chroma chroma = Chroma::SAME;
 		std::vector<int> frame_map; // which decoded frame, counting in display order, each output frame is
 		std::vector<int> display_order; // where the frame of each packet comes in display order
 		std::vector<bool> needed; // the decoded frames that are an output frame
@@ -356,6 +363,7 @@ namespace {
 
 		Process process;
 		std::thread thread;
+		std::once_flag start_once;
 
 		std::mutex mutex;
 		std::condition_variable frame_ready;
@@ -542,12 +550,13 @@ namespace {
 				return surfaces;
 			}
 
-			cudaVideoChromaFormat chroma = subsampled ? cudaVideoChromaFormat_420 : cudaVideoChromaFormat_444;
-			cudaVideoSurfaceFormat output = subsampled ? cudaVideoSurfaceFormat_NV12 : cudaVideoSurfaceFormat_YUV444;
+			bool interleaved = chroma == Chroma::INTERLEAVED;
+			cudaVideoChromaFormat chroma_format = interleaved ? cudaVideoChromaFormat_420 : cudaVideoChromaFormat_444;
+			cudaVideoSurfaceFormat output = interleaved ? cudaVideoSurfaceFormat_NV12 : cudaVideoSurfaceFormat_YUV444;
 
 			bool expected = format->codec == (hevc ? cudaVideoCodec_HEVC : cudaVideoCodec_H264) &&
 			                format->bit_depth_luma_minus8 == 0 && format->bit_depth_chroma_minus8 == 0 &&
-			                format->progressive_sequence && format->chroma_format == chroma &&
+			                format->progressive_sequence && format->chroma_format == chroma_format &&
 			                format->display_area.right - format->display_area.left == vi.width &&
 			                format->display_area.bottom - format->display_area.top == vi.height;
 			if (!expected)
@@ -555,7 +564,7 @@ namespace {
 
 			CUVIDDECODECAPS caps = {};
 			caps.eCodecType = format->codec;
-			caps.eChromaFormat = chroma;
+			caps.eChromaFormat = chroma_format;
 			caps.nBitDepthMinus8 = 0;
 			if (nv.cuvidGetDecoderCaps(&caps) != CUDA_SUCCESS || !caps.bIsSupported ||
 			    !(caps.nOutputFormatMask & (1 << output)) || format->coded_width > caps.nMaxWidth ||
@@ -571,7 +580,7 @@ namespace {
 			info.ulMaxHeight = format->coded_height;
 			info.ulNumDecodeSurfaces = surfaces;
 			info.CodecType = format->codec;
-			info.ChromaFormat = chroma;
+			info.ChromaFormat = chroma_format;
 			info.ulCreationFlags = cudaVideoCreate_PreferCUVID;
 			info.bitDepthMinus8 = 0;
 			info.display_area.left = (short)format->display_area.left;
@@ -675,17 +684,31 @@ namespace {
 			unsigned int pitch = 0;
 			bool copied = false;
 			if (nv.cuvidMapVideoFrame64(decoder, info->picture_index, &mapped, &pitch, &process_params) == CUDA_SUCCESS) {
-				// the planes are one under the other, so they come over as one tall image
-				CUDA_MEMCPY2D copy = {};
-				copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-				copy.srcDevice = mapped;
-				copy.srcPitch = pitch;
-				copy.dstMemoryType = CU_MEMORYTYPE_HOST;
-				copy.dstHost = buffer->data;
-				copy.dstPitch = vi.width;
-				copy.WidthInBytes = vi.width;
-				copy.Height = frame_size / vi.width;
-				copied = nv.cuMemcpy2D_v2(&copy) == CUDA_SUCCESS;
+				// the planes are one under the other, each as wide as the frame
+				auto read_rows = [&](size_t first, size_t step, size_t rows, uint8_t* to) {
+					CUDA_MEMCPY2D copy = {};
+					copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+					copy.srcDevice = mapped + first * pitch;
+					copy.srcPitch = step * pitch;
+					copy.dstMemoryType = CU_MEMORYTYPE_HOST;
+					copy.dstHost = to;
+					copy.dstPitch = vi.width;
+					copy.WidthInBytes = vi.width;
+					copy.Height = rows;
+					return nv.cuMemcpy2D_v2(&copy) == CUDA_SUCCESS;
+				};
+
+				size_t height = vi.height;
+				if (chroma == Chroma::HALVED) {
+					// only the chroma rows the clip has samples from: the lower of each two, in
+					// both planes
+					copied = read_rows(0, 1, height, buffer->data) &&
+					         read_rows(height + 1, 2, height, buffer->data + height * vi.width);
+				}
+				else {
+					copied = read_rows(0, 1, frame_size / vi.width, buffer->data);
+				}
+
 				nv.cuvidUnmapVideoFrame64(decoder, mapped);
 			}
 
@@ -723,14 +746,16 @@ namespace {
 			size_t luma_size = (size_t)vi.width * vi.height;
 			copy_plane(0, in);
 
-			if (!subsampled) {
+			if (chroma == Chroma::SAME) {
 				copy_plane(1, in + luma_size);
 				copy_plane(2, in + 2 * luma_size);
 				return;
 			}
 
-			// the two chroma planes are interleaved in one
-			const uint8_t* interleaved = in + luma_size;
+			// what's there has two bytes for each chroma sample of the clip. interleaved, they are
+			// the sample of either plane. otherwise it's the rows of one plane and then the other,
+			// of which the clip has the left sample of each two, like resize.Point would take
+			const uint8_t* rows = in + luma_size;
 			int w = plane_width(1);
 			int h = plane_height(1);
 			uint8_t* out_u = vsapi->getWritePtr(frame, 1);
@@ -738,23 +763,37 @@ namespace {
 			ptrdiff_t stride = vsapi->getStride(frame, 1);
 			const __m128i low_bytes = _mm_set1_epi16(0x00ff);
 
-			for (int y = 0; y < h; y++) {
-				const uint8_t* row = interleaved + (size_t)y * vi.width;
-				uint8_t* u = out_u + y * stride;
-				uint8_t* v = out_v + y * stride;
-
+			auto even_bytes = [&](const uint8_t* row, uint8_t* out) {
 				int x = 0;
 				for (; x + 16 <= w; x += 16) {
-					__m128i a = _mm_loadu_si128((const __m128i*)(row + 2 * x));
-					__m128i b = _mm_loadu_si128((const __m128i*)(row + 2 * x + 16));
-					_mm_storeu_si128(
-						(__m128i*)(u + x), _mm_packus_epi16(_mm_and_si128(a, low_bytes), _mm_and_si128(b, low_bytes))
-					);
-					_mm_storeu_si128((__m128i*)(v + x), _mm_packus_epi16(_mm_srli_epi16(a, 8), _mm_srli_epi16(b, 8)));
+					__m128i a = _mm_and_si128(_mm_loadu_si128((const __m128i*)(row + 2 * x)), low_bytes);
+					__m128i b = _mm_and_si128(_mm_loadu_si128((const __m128i*)(row + 2 * x + 16)), low_bytes);
+					_mm_storeu_si128((__m128i*)(out + x), _mm_packus_epi16(a, b));
 				}
-				for (; x < w; x++) {
-					u[x] = row[2 * x];
-					v[x] = row[2 * x + 1];
+				for (; x < w; x++)
+					out[x] = row[2 * x];
+			};
+
+			auto odd_bytes = [&](const uint8_t* row, uint8_t* out) {
+				int x = 0;
+				for (; x + 16 <= w; x += 16) {
+					__m128i a = _mm_srli_epi16(_mm_loadu_si128((const __m128i*)(row + 2 * x)), 8);
+					__m128i b = _mm_srli_epi16(_mm_loadu_si128((const __m128i*)(row + 2 * x + 16)), 8);
+					_mm_storeu_si128((__m128i*)(out + x), _mm_packus_epi16(a, b));
+				}
+				for (; x < w; x++)
+					out[x] = row[2 * x + 1];
+			};
+
+			for (int y = 0; y < h; y++) {
+				if (chroma == Chroma::INTERLEAVED) {
+					const uint8_t* row = rows + (size_t)y * vi.width;
+					even_bytes(row, out_u + y * stride);
+					odd_bytes(row, out_v + y * stride);
+				}
+				else {
+					even_bytes(rows + (size_t)y * vi.width, out_u + y * stride);
+					even_bytes(rows + (size_t)(h + y) * vi.width, out_v + y * stride);
 				}
 			}
 		}
@@ -763,6 +802,13 @@ namespace {
 		const VSFrame* get(int n, VSCore* core, const VSAPI* vsapi) {
 			if (rejected)
 				return nullptr;
+
+			// a clip that's never read from doesn't decode anything
+			std::call_once(start_once, [&] {
+				thread = std::thread([this] {
+					run();
+				});
+			});
 
 			int frame = frame_map[n];
 			Buffer* buffer = nullptr;
@@ -923,8 +969,25 @@ namespace {
 		if (!yuv8 || !(yuv444 || yuv420))
 			return fail("blurflow: the source must be constant format yuv420p8 or yuv444p8");
 
-		s->subsampled = yuv420;
-		s->frame_size = (size_t)s->vi.width * s->vi.height * (yuv420 ? 3 : 6) / 2;
+		// the clip's frames can be 4:2:0 when the video is 4:4:4, to save converting them
+		int err = 0;
+		bool halved = vsapi->mapGetInt(in, "subsample", 0, &err) != 0;
+		if (halved && !yuv420)
+			return fail("blurflow: the source must be yuv420p8 to subsample to");
+
+		size_t luma_size = (size_t)s->vi.width * s->vi.height;
+		if (halved) {
+			s->chroma = Chroma::HALVED;
+			s->frame_size = luma_size * 2;
+		}
+		else if (yuv420) {
+			s->chroma = Chroma::INTERLEAVED;
+			s->frame_size = luma_size * 3 / 2;
+		}
+		else {
+			s->chroma = Chroma::SAME;
+			s->frame_size = luma_size * 3;
+		}
 
 		std::string codec(vsapi->mapGetData(in, "codec", 0, nullptr), vsapi->mapGetDataSize(in, "codec", 0, nullptr));
 		if (codec != "hevc" && codec != "h264")
@@ -962,9 +1025,6 @@ namespace {
 		}
 
 		s->buffers.resize(HELD_FRAMES);
-		s->thread = std::thread([source = s.get()] {
-			source->run();
-		});
 
 		const VSFilterDependency deps[] = { { s->fallback, rpGeneral } };
 		const VSVideoInfo vi = s->vi;
@@ -975,7 +1035,7 @@ namespace {
 void register_source_filter(VSPlugin* plugin, const VSPLUGINAPI* vspapi) {
 	vspapi->registerFunction(
 		"Source",
-		"fallback:vnode;command:data[];frames:int[];order:int[];codec:data;",
+		"fallback:vnode;command:data[];frames:int[];order:int[];codec:data;subsample:int:opt;",
 		"clip:vnode;",
 		create,
 		nullptr,

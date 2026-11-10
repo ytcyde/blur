@@ -188,16 +188,34 @@ def gpu_decoded(reference: vs.VideoNode, video_path: Path, fps_num: int, fps_den
         "-",
     ]
 
-    try:
-        return core.blurflow.Source(
-            reference,
-            command=command,
-            frames=frame_map,
-            order=display_order,
-            codec=codec,
+    def source(fallback: vs.VideoNode, **options):
+        try:
+            return core.blurflow.Source(
+                fallback,
+                command=command,
+                frames=frame_map,
+                order=display_order,
+                codec=codec,
+                **options,
+            )
+        except vs.Error:
+            return None
+
+    video = source(reference)
+
+    if (
+        video is not None
+        and reference.format.id == vs.YUV444P8
+        and reference.width % 2 == 0
+        and reference.height % 2 == 0
+    ):
+        # most of what's done with a clip is done in yuv420p8. the decoder can put out what
+        # converting the clip to it would give, which is a third less to bring over from the gpu
+        u.provide_subsampled(
+            video, lambda: source(core.blurflow.Subsample(reference), subsample=1)
         )
-    except vs.Error:
-        return None
+
+    return video
 
 
 def open_video(video_path: Path, fps_num, fps_den, gpu_decoding: bool):
@@ -218,4 +236,10 @@ def open_video(video_path: Path, fps_num, fps_den, gpu_decoding: bool):
     if not gpu_decoding:
         return video
 
-    return gpu_decoded(video, video_path, fps_num, fps_den) or lsmash(3)
+    decoded = gpu_decoded(video, video_path, fps_num, fps_den)
+    if decoded is not None:
+        return decoded
+
+    # lsmash's own gpu decoding turns some video (4:4:4, for one) into yuv420p8
+    hardware = lsmash(3)
+    return hardware if hardware.format.id == video.format.id else video
