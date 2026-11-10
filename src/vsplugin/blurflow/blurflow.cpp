@@ -10,6 +10,7 @@
 #include "chroma.h"
 #include "kernel.h"
 #include "opencl_min.h"
+#include "source.h"
 
 #include <algorithm>
 #include <cstring>
@@ -965,4 +966,5 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI
 		plugin
 	);
 	register_chroma_filters(plugin, vspapi);
+	register_source_filter(plugin, vspapi);
 }
