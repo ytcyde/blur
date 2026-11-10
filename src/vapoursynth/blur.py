@@ -155,7 +155,7 @@ def get_blended_render(interpolated_fps):
         return None
 
     blend = get_blur_weights(interpolated_fps)
-    if blend is None or not blur.interpolate.has_blurflow():
+    if blend is None or not u.has_blurflow():
         return None
 
     return dict(

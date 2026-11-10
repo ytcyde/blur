@@ -7,6 +7,7 @@
 // and sums them on the gpu, so only the finished output frames are read back.
 
 #include "VapourSynth4.h"
+#include "chroma.h"
 #include "kernel.h"
 #include "opencl_min.h"
 
@@ -933,4 +934,5 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI
 		nullptr,
 		plugin
 	);
+	register_chroma_filters(plugin, vspapi);
 }

@@ -51,9 +51,38 @@ def assume_scaled_fps(clip, timescale):
     )
 
 
+def has_blurflow():
+    if hasattr(core, "blurflow"):
+        return True
+
+    # not in vapoursynth's plugin folder, it may be sitting next to the scripts instead
+    for plugin in Path(__file__).parent.parent.glob("blurflow.*"):
+        try:
+            core.std.LoadPlugin(path=str(plugin))
+            return True
+        except vs.Error:
+            pass
+
+    return False
+
+
 def convert_format(video: vs.VideoNode, is_full_color_range: bool, target_format):
     if video.format.id == target_format:
         return video
+
+    # svp works in yuv420p8, so the usual conversion is to it and back from yuv444p8. blurflow
+    # does just that, giving the same frames as resize.Point a lot faster
+    if (
+        not is_full_color_range
+        and video.width % 2 == 0
+        and video.height % 2 == 0
+        and has_blurflow()
+    ):
+        match (video.format.id, target_format):
+            case (vs.YUV444P8, vs.YUV420P8):
+                return core.blurflow.Subsample(video)
+            case (vs.YUV420P8, vs.YUV444P8):
+                return core.blurflow.Upsample(video)
 
     convert_kwargs = {
         "format": target_format,

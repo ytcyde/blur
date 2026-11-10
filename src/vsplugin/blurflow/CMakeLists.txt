@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # a vapoursynth plugin. opencl is loaded at runtime, so there is nothing to link against
-add_library(blurflow MODULE blurflow.cpp)
+add_library(blurflow MODULE blurflow.cpp chroma.cpp)
 set_target_properties(blurflow PROPERTIES PREFIX "")
 
 if(NOT WIN32)

@@ -5,7 +5,6 @@ from vapoursynth import core
 
 import json
 import math
-from pathlib import Path
 
 import blur.utils as u
 
@@ -113,21 +112,6 @@ def svp(
     return u.with_format(
         _video, is_full_color_range, vs.YUV420P8, process, restore_format
     )
-
-
-def has_blurflow():
-    if hasattr(core, "blurflow"):
-        return True
-
-    # not in vapoursynth's plugin folder, it may be sitting next to the scripts instead
-    for plugin in Path(__file__).parent.parent.glob("blurflow.*"):
-        try:
-            core.std.LoadPlugin(path=str(plugin))
-            return True
-        except vs.Error:
-            pass
-
-    return False
 
 
 def render_blended(
