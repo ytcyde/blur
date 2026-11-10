@@ -7,6 +7,9 @@ const std::string WINDOWS_INSTALLER_NAME = "blur-Windows-Installer-x64.exe";
 const std::vector<std::string> WINDOWS_INSTALLER_ARGS = { "/UPDATE" };
 const std::string MACOS_INSTALLER_NAME = "blur-macOS-Release-arm64.dmg";
 
+// releases come from this fork, not upstream f0e/blur
+const std::string RELEASES_REPO = "ytcyde/blur";
+
 namespace {
 	bool is_version_newer(std::string current, std::string latest) {
 		// Remove leading 'v' if present
@@ -57,7 +60,7 @@ namespace {
 }
 
 tl::expected<updates::UpdateCheckRes, std::string> updates::is_latest_version(bool include_beta) {
-	std::string url = "https://api.github.com/repos/f0e/blur/releases";
+	std::string url = "https://api.github.com/repos/" + RELEASES_REPO + "/releases";
 
 	auto response = cpr::Get(cpr::Url{ url });
 
@@ -120,7 +123,7 @@ tl::expected<updates::UpdateCheckRes, std::string> updates::is_latest_version(bo
 		return updates::UpdateCheckRes{
 			.is_latest = is_latest,
 			.latest_tag = latest_tag,
-			.latest_tag_url = "https://github.com/f0e/blur/releases/" + latest_tag,
+			.latest_tag_url = "https://github.com/" + RELEASES_REPO + "/releases/" + latest_tag,
 		};
 	}
 	catch (const std::exception& e) {
@@ -151,7 +154,8 @@ bool updates::update_to_tag(
 #endif
 
 		// Create download URL
-		std::string download_url = "https://github.com/f0e/blur/releases/download/" + tag + "/" + installer_filename;
+		std::string download_url =
+			"https://github.com/" + RELEASES_REPO + "/releases/download/" + tag + "/" + installer_filename;
 
 		// Open file for writing
 		std::ofstream installer_file(installer_path, std::ios::binary);
